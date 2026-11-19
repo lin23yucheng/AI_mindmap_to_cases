@@ -27,7 +27,7 @@ LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
 LLM_CONNECT_TIMEOUT_SECONDS = int(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "10"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 LLM_FULL_CASE_MAX_TOKENS = int(os.getenv("LLM_FULL_CASE_MAX_TOKENS", "4000"))
-LLM_PROJECT_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_PROJECT_SUMMARY_MAX_TOKENS", "24000"))
+LLM_PROJECT_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_PROJECT_SUMMARY_MAX_TOKENS", "65536"))
 LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS", "180"))
 PROJECT_SUMMARY_CACHE_VERSION = 7
 # 仅用于日志预警，不会截断任何思维导图测试点上下文。
@@ -647,7 +647,6 @@ def llm_generate_project_summary(project_test_point_context, module_paths, model
         "messages": [{"role": "system", "content": prompt}],
         "temperature": 0,
         "max_tokens": LLM_PROJECT_SUMMARY_MAX_TOKENS,
-        "response_format": {"type": "json_object"},
     }
 
     last_failure_reason = "未知错误"

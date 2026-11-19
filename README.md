@@ -37,7 +37,7 @@ LLM_SUMMARY_REASONING_EFFORT=high
 LLM_GENERATION_MODEL=deepseek-flash
 LLM_GENERATION_REASONING_EFFORT=low
 # 整图摘要最多生成的 token 数，默认值为 24000。
-LLM_PROJECT_SUMMARY_MAX_TOKENS=24000
+LLM_PROJECT_SUMMARY_MAX_TOKENS=65536
 ```
 
 `LLM_REASONING_MODEL` 与 `LLM_SUMMARY_REASONING_EFFORT` 用于整图/模块摘要；`LLM_GENERATION_MODEL` 与 `LLM_GENERATION_REASONING_EFFORT` 用于逐节点生成用例。DeepSeek 当前模型 ID 使用 `deepseek-flash`，思考强度通过 API 请求参数 `reasoning_effort` 设定。官方文档列出的强度包括 `low`、`high` 和 `max`。
