@@ -1,0 +1,17 @@
+# Local secrets and Python environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.idea/
+
+# Generated CSV, summary cache and generation progress
+/outputs/*
+!/outputs/csv/
+/outputs/csv/*
+!/outputs/csv/.gitkeep
+*.breakpoint
+*.project_context.json

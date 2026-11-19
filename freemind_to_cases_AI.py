@@ -1,0 +1,1160 @@
+import argparse
+import sys
+import xml.etree.ElementTree as ET
+import csv
+import copy
+import os
+import requests
+import json
+import time
+import re
+import logging
+import hashlib
+from functools import lru_cache
+from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")  # 仅加载本项目配置；显式设置的进程环境变量优先。
+
+# ===== LLM 配置 =====
+INCLUDE_PARENT = False  # 仅提取叶子节点
+FREEMIND_FILE = "具身智能数据平台V1.0测试点.mm"
+DEFAULT_PROVIDER = "deepseek"
+
+# DeepSeek 请求参数，可在本项目 .env 中覆盖。
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+LLM_CONNECT_TIMEOUT_SECONDS = int(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "10"))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_FULL_CASE_MAX_TOKENS = int(os.getenv("LLM_FULL_CASE_MAX_TOKENS", "4000"))
+LLM_PROJECT_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_PROJECT_SUMMARY_MAX_TOKENS", "24000"))
+LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS", "180"))
+PROJECT_SUMMARY_CACHE_VERSION = 6
+# 仅用于日志预警，不会截断任何思维导图测试点上下文。
+LLM_CONTEXT_WARNING_CHARS = int(os.getenv("LLM_CONTEXT_WARNING_CHARS", "150000"))
+TESTER_NAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "tester-names.json")
+BUSINESS_MODULES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "business-modules.json"
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+
+class ChineseArgumentParser(argparse.ArgumentParser):
+    """将argparse自动生成的终端帮助标题转换为中文。"""
+
+    def format_help(self):
+        help_text = super().format_help()
+        replacements = {
+            "usage:": "用法：",
+            "options:": "可选参数：",
+            "positional arguments:": "位置参数：",
+            "show this help message and exit": "显示帮助信息并退出",
+        }
+        for source, target in replacements.items():
+            help_text = help_text.replace(source, target)
+        return help_text
+
+FULL_CASE_SYSTEM_PROMPT = """你是专业测试工程师，严格遵守约束：
+1. 仅允许基于提供的【测试点原文】生成测试用例，绝对不能新增测试点不存在的业务规则、校验逻辑、功能限制；禁止脑补任何未写明的隐性需求。
+   生成前必须先综合理解【项目业务摘要】、【当前模块摘要】及整份测试点形成的业务关系，识别角色、状态、数据流和跨模块前置约束；不能把当前焦点测试点当成孤立标题处理。前两者只用于理解原文中已明确的术语、上下文和关联约束；当前焦点测试点决定本次用例要验证什么。
+   当前焦点测试点中明确的每项约束必须在输出用例的标题、前置条件、操作步骤或预期结果中得到体现；若拆分多条用例，则这些用例合起来必须覆盖全部焦点约束。
+2. 输出固定结构，仅返回JSON，不要额外解释、前言、markdown格式。
+返回格式必须是以下 JSON 对象，cases 必须是数组，即使仅生成一条用例也不能省略外层对象或数组：
+{
+  \"cases\": [
+    {
+      \"case_title\": \"精炼标准用例名称\",
+      \"module_name\": \"从当前测试点层级中识别出的业务模块名称\",
+      \"precondition\": \"预置/前置条件\",
+      \"operation_steps\": \"分步清晰的操作步骤\",
+      \"expected_result\": \"明确可校验的预期结果\",
+      \"priority\": \"1-4 之一\"
+    }
+  ]
+}
+3. operation_steps 与 expected_result 必须均使用从 1 开始的数字序号。两者条目数量必须严格相等，且第 N 条预期结果只能对应第 N 条操作步骤；不得合并步骤预期、不得遗漏任一步骤的预期结果。
+4. 区分正向、边界、异常场景；测试数据贴合测试点约束；
+5. 如果单个测试点可以拆分多条独立场景，在 cases 数组中输出多条用例；
+6. 语言简洁，适配导入测试管理平台。
+   module_name 必须从当前焦点测试点的层级路径中选择，且只能是【业务模块清单】中的名称：{{business_modules}}。根节点、业务分组、具体功能、动作、字段或测试条件不是模块。括号中的 {{tester_names}} 是测试人员标记，不是模块名称，应忽略。case_title 必须以 module_name 开头，格式为“模块名称 - 业务测试目标”。同一业务目标下可以连续完成的操作应合并为一条用例，只有前置条件、数据或预期结果彼此独立时才拆分多条用例。
+7. 每条用例必须给出 priority，且只能是字符串 \"1\"、\"2\"、\"3\" 或 \"4\"。结合当前焦点测试点、所在模块和已明确的全图上下文判断：
+   - 1：核心主链路阻断、明显安全风险、数据丢失/错误或系统不可用风险；
+   - 2：重要或高频功能、主要异常处理与关键业务规则；
+   - 3：一般功能验证、常规边界与低频异常场景；
+   - 4：仅影响展示、文案、样式或其他低影响体验的场景。
+   测试点没有足够信息时使用 \"2\"，不得根据未提供的业务信息臆测风险。
+【待处理测试点原文】：{{full_test_point_text}}"""
+
+PROJECT_SUMMARY_SYSTEM_PROMPT = """你是资深测试分析师。仅基于提供的思维导图叶子测试点，提炼可供后续测试用例生成使用的业务上下文。
+不得补充、推断或臆测任何未在原文明确出现的业务规则。不要生成测试用例。
+摘要将直接作为后续逐条生成测试用例的业务依据，必须在原文信息范围内尽量完整，不得为了简短而遗漏会影响测试设计的明确规则。
+project_summary 不超过 3500 个中文字符，完整提炼全局术语、角色与权限、主业务流程、状态流转、跨模块依赖、公共数据规则、引用关系和全局副作用。
+每个 module_summaries 值不超过 1200 个中文字符，按原文覆盖该模块明确出现的：功能范围、角色权限、前置条件、字段与控件、默认值、必填与唯一性、格式与数值边界、状态及可执行动作、正向/异常分支、提示或阻止方式、提交后的最终业务状态、统计口径、文件/存储规则、与其他模块的输入输出关系、删除/禁用/清理影响。原文未涉及的维度不要补写。
+涉及具体数字、枚举值、状态名、角色名、格式、路径、文件类型和错误条件时必须原样保留。不同规则使用分号分隔，避免空泛概括。不要输出思考过程、解释或测试用例。
+仅返回以下合法 JSON 对象：
+{
+  "project_summary": "全局术语、角色、跨模块关联及明确约束的精炼摘要；没有则为空字符串",
+  "module_summaries": {
+    "模块路径": "该模块已明确的业务规则、状态关系和与其他模块的关联；没有则为空字符串"
+  }
+}
+module_summaries 必须包含下方【模块路径】中的每个原始键。没有明确上下文时填写“无额外模块约束”，不得省略键或创造新键。
+【模块路径】中的键来自项目配置，是权威业务模块名称；思维导图中的“总览、任务执行、数据产出、平台治理”等仅是分组，不得作为模块键。没有匹配明确业务模块的测试点统一归入配置的“其他”模块。
+【模块路径】
+{{module_paths}}
+【整份思维导图叶子测试点】
+{{project_test_points}}"""
+
+cases_format = {
+    "源测试点ID": "",
+    "所属模块": "",
+    "用例名称": "",
+    "前置条件": "",
+    "步骤": "1.\n2.\n3.\n",
+    "预期": "",
+    "关键词": "1",
+    "优先级": "3",
+    "用例类型": "功能测试",
+    "适用阶段": "功能测试阶段"
+}
+
+# LLM 的英文键仅用于内部解析；导出保持原有测试管理平台中文字段。
+FULL_CASE_FIELDS = ["case_title", "module_name", "precondition", "operation_steps", "expected_result"]
+VALID_PRIORITIES = {"1", "2", "3", "4"}
+DEFAULT_PRIORITY = "2"
+
+
+def load_tester_names():
+    """Load test-point author names that must not become business modules or case titles."""
+    try:
+        with open(TESTER_NAMES_FILE, "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except FileNotFoundError:
+        logger.warning("未找到测试人员名单文件：%s；不执行署名过滤", TESTER_NAMES_FILE)
+        return frozenset()
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"测试人员名单文件无效：{TESTER_NAMES_FILE}：{exc}") from exc
+
+    names = parsed.get("testerNames", []) if isinstance(parsed, dict) else parsed
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise ValueError(f"测试人员名单必须是字符串数组：{TESTER_NAMES_FILE}")
+    return frozenset(name.strip() for name in names if name.strip())
+
+
+TESTER_NAMES = load_tester_names()
+
+
+def load_business_module_config():
+    """读取项目确认的业务模块与未匹配测试点的兜底模块。"""
+    try:
+        with open(BUSINESS_MODULES_FILE, "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except FileNotFoundError as exc:
+        raise ValueError(f"未找到业务模块配置：{BUSINESS_MODULES_FILE}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"业务模块配置无效：{BUSINESS_MODULES_FILE}：{exc}") from exc
+
+    names = parsed.get("moduleNames", []) if isinstance(parsed, dict) else []
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or not name.strip() for name in names)):
+        raise ValueError(f"业务模块配置 moduleNames 必须是非空字符串数组：{BUSINESS_MODULES_FILE}")
+    normalised = [name.strip() for name in names]
+    if len(set(normalised)) != len(normalised):
+        raise ValueError(f"业务模块配置中存在重复名称：{BUSINESS_MODULES_FILE}")
+    fallback = str(parsed.get("fallbackModule", "")).strip()
+    if not fallback:
+        raise ValueError(f"业务模块配置 fallbackModule 必须是非空字符串：{BUSINESS_MODULES_FILE}")
+    if fallback in normalised:
+        raise ValueError(f"兜底模块不能与 moduleNames 重复：{BUSINESS_MODULES_FILE}")
+    return tuple(normalised), fallback
+
+
+BUSINESS_MODULES, FALLBACK_BUSINESS_MODULE = load_business_module_config()
+BUSINESS_MODULE_OPTIONS = BUSINESS_MODULES + (FALLBACK_BUSINESS_MODULE,)
+
+
+def clean_tester_annotation(value):
+    """Remove only configured parenthesized authors or standalone author nodes."""
+    text = str(value or "").strip()
+    if not text or not TESTER_NAMES:
+        return text
+    if text in TESTER_NAMES:
+        return ""
+    alternatives = "|".join(re.escape(name) for name in sorted(TESTER_NAMES, key=len, reverse=True))
+    return re.sub(rf"\s*[（(]\s*(?:{alternatives})\s*[）)]", "", text).strip()
+
+
+# 导出列仅保留原始字段，避免与 LLM 内部字段形成重复列。
+EXPORT_FIELDS = list(cases_format.keys())
+
+# 定义字段映射关系
+FIELD_MAPPING = {
+    "前置条件": ["前置条件", "precondition", "前提条件"],
+    "步骤": ["步骤", "steps", "procedure", "操作步骤"],
+    "预期": ["预期", "expected", "expected_result", "预期结果"]
+}
+
+
+@lru_cache(maxsize=1)
+def get_llm_config():
+    """根据环境变量加载 DeepSeek 配置。"""
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+
+    if provider != DEFAULT_PROVIDER:
+        raise ValueError(f"不支持的 LLM_PROVIDER: {provider}。当前仅支持 deepseek")
+
+    configured_api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    api_url = os.getenv("DEEPSEEK_API_URL") or "https://api.deepseek.com/chat/completions"
+
+    if not configured_api_key:
+        raise ValueError("未配置 API Key，请在 .env 中设置 DEEPSEEK_API_KEY")
+
+    if not api_url:
+        raise ValueError("未配置 API URL，请在 .env 中设置 DEEPSEEK_API_URL")
+
+    return {
+        "provider": provider,
+        "api_key": configured_api_key,
+        "api_url": api_url,
+    }
+
+
+def get_workflow_models():
+    """为全图推理和批量用例生成选择独立模型，允许环境变量覆盖。"""
+    return {
+        "reasoning_model": os.getenv("LLM_REASONING_MODEL", "deepseek-v4-pro"),
+        "generation_model": os.getenv("LLM_GENERATION_MODEL", "deepseek-chat"),
+    }
+
+
+def _strip_json_markdown(text):
+    """移除模型可能返回的 ```json 代码块包裹。"""
+    if not isinstance(text, str):
+        return text
+
+    content = text.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", content, flags=re.S | re.I)
+    return match.group(1).strip() if match else content
+
+
+def _extract_response_content(result):
+    """兼容提取 chat/completions 响应中的文本内容。"""
+    if not result.get("choices"):
+        return ""
+
+    message = result["choices"][0].get("message", {})
+    content = message.get("content", "")
+
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and item.get("text"):
+                    text_parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    text_parts.append(item["content"])
+        content = "\n".join(text_parts)
+
+    if isinstance(content, dict):
+        content = json.dumps(content, ensure_ascii=False)
+
+    return _strip_json_markdown(content)
+
+
+def _response_metadata(result):
+    """提取响应结构信息，辅助定位空 content，避免记录模型正文。"""
+    choices = result.get("choices") or []
+    choice = choices[0] if choices else {}
+    message = choice.get("message") or {}
+    usage = result.get("usage") or {}
+
+    def value_length(value):
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, list):
+            return len(value)
+        return 0 if value is None else len(str(value))
+
+    return {
+        "choice_count": len(choices),
+        "finish_reason": choice.get("finish_reason"),
+        "message_keys": sorted(message.keys()),
+        "content_length": value_length(message.get("content")),
+        "reasoning_content_length": value_length(message.get("reasoning_content")),
+        "completion_tokens": usage.get("completion_tokens"),
+        "reasoning_tokens": usage.get("completion_tokens_details", {}).get("reasoning_tokens"),
+    }
+
+
+def map_fields(data):
+    """将模型返回的字段映射到CSV表头"""
+    mapped_data = {}
+    for target_field, possible_fields in FIELD_MAPPING.items():
+        for source_field in possible_fields:
+            if source_field in data:
+                mapped_data[target_field] = data[source_field]
+                break
+    return mapped_data
+
+
+def ensure_step_expectation_match(steps, expectations):
+    """确保步骤和预期结果的序号匹配，并清理重复序号"""
+
+    def clean_duplicate_first_numbering(text):
+        return re.sub(r'^(\d+\.\s+)\1+', r'\1', text, count=1, flags=re.M)
+
+    steps = clean_duplicate_first_numbering(steps)
+    expectations = clean_duplicate_first_numbering(expectations)
+
+    # 解析步骤和预期
+    step_list = []
+    step_lines = steps.strip().split('\n')
+    current_step = ""
+    current_num = None
+
+    for line in step_lines:
+        match = re.match(r'^(\d+)\.\s+(.*)$', line)
+        if match:
+            if current_step:
+                step_list.append(current_step)
+            current_num = match.group(1)
+            current_step = match.group(2)
+        else:
+            if current_step:
+                current_step += '\n' + line
+            else:
+                current_step = line
+
+    if current_step:
+        step_list.append(current_step)
+
+    # 对预期结果执行相同的解析逻辑
+    exp_list = []
+    exp_lines = expectations.strip().split('\n')
+    current_exp = ""
+    current_exp_num = None
+
+    for line in exp_lines:
+        match = re.match(r'^(\d+)\.\s+(.*)$', line)
+        if match:
+            if current_exp:
+                exp_list.append(current_exp)
+            current_exp_num = match.group(1)
+            current_exp = match.group(2)
+        else:
+            if current_exp:
+                current_exp += '\n' + line
+            else:
+                current_exp = line
+
+    if current_exp:
+        exp_list.append(current_exp)
+
+    # 如果数量不匹配，尝试补齐
+    max_len = max(len(step_list), len(exp_list))
+
+    # 确保两个列表长度相同
+    while len(step_list) < max_len:
+        step_list.append("")
+    while len(exp_list) < max_len:
+        exp_list.append("")
+
+    # 重新格式化，确保都有序号
+    formatted_steps = "\n".join([f"{i + 1}. {step}" for i, step in enumerate(step_list)])
+    formatted_expectations = "\n".join([f"{i + 1}. {exp}" for i, exp in enumerate(exp_list)])
+
+    return formatted_steps, formatted_expectations
+
+
+def _escape_control_characters_in_json_strings(text):
+    """转义 JSON 字符串内模型错误输出的原始控制字符。"""
+    escaped = []
+    in_string = False
+    is_escaped = False
+
+    for char in text:
+        if in_string and char == "\n":
+            escaped.append("\\n")
+        elif in_string and char == "\r":
+            escaped.append("\\r")
+        elif in_string and char == "\t":
+            escaped.append("\\t")
+        else:
+            escaped.append(char)
+
+        if char == '"' and not is_escaped:
+            in_string = not in_string
+        is_escaped = char == "\\" and not is_escaped
+        if char != "\\":
+            is_escaped = False
+
+    return "".join(escaped)
+
+
+def robust_json_parse(json_str):
+    """解析模型返回的 JSON，并兼容字符串中的原始换行符。"""
+    json_str = _strip_json_markdown(json_str)
+
+    try:
+        # 尝试直接解析
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        # print(f"⚠️ JSON解析失败: {e}")
+
+        # 某些模型会在 JSON 字符串中输出原始换行符，修复后再解析。
+        try:
+            fixed_str = _escape_control_characters_in_json_strings(json_str)
+            return json.loads(fixed_str)
+        except json.JSONDecodeError as e2:
+            logger.debug("JSON 修复后仍无法解析: %s", e2)
+
+            # 按已知字段边界恢复缺少闭合引号的响应。
+            try:
+                fields = ("前置条件", "步骤", "预期")
+                recovered = {}
+                for index, field in enumerate(fields):
+                    next_fields = fields[index + 1:]
+                    boundaries = [rf'\s*,?\s*"{name}"\s*:' for name in next_fields]
+                    boundaries.append(r'\s*}\s*$')
+                    match = re.search(
+                        rf'"{field}"\s*:\s*"(.*?)(?={"|".join(boundaries)})',
+                        json_str,
+                        flags=re.S,
+                    )
+                    if match:
+                        recovered[field] = match.group(1).rstrip('"').strip()
+
+                return recovered
+            except Exception as e3:
+                logger.debug("无法提取任何 JSON 信息: %s", e3)
+                return {}
+
+
+def _extract_json_value(text):
+    """从模型的额外说明中提取最先出现的 JSON 对象或数组。"""
+    cleaned = _strip_json_markdown(text)
+    direct_value = robust_json_parse(cleaned)
+    if direct_value:
+        return direct_value
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(cleaned):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return {}
+
+
+def normalise_priority(value):
+    """仅保留测试管理平台支持的 1 至 4 级优先级。"""
+    priority = str(value).strip()
+    if priority in VALID_PRIORITIES:
+        return priority
+    logger.warning("LLM 返回了无效优先级 %r，已使用默认优先级 %s", value, DEFAULT_PRIORITY)
+    return DEFAULT_PRIORITY
+
+
+def _response_diagnostic(content, limit=300):
+    """输出可定位格式问题的响应摘要，避免日志包含常见敏感信息。"""
+    compact = re.sub(r"\s+", " ", content).strip()
+    compact = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[手机号]", compact)
+    compact = re.sub(r"[\w.+-]+@[\w.-]+", "[邮箱]", compact)
+    suffix = "..." if len(compact) > limit else ""
+    return f"长度 {len(content)}，前缀：{compact[:limit]}{suffix}"
+
+
+def _normalise_full_case_response(content, with_diagnostics=False):
+    """校验完整用例响应结构；诊断信息只描述格式，不包含用例正文。"""
+    parsed = _extract_json_value(content)
+    if not parsed:
+        result = ([], "模型响应无法解析为 JSON 对象或 JSON 数组")
+        return result if with_diagnostics else result[0]
+
+    if isinstance(parsed, dict) and "cases" in parsed:
+        wrapped_cases = parsed["cases"]
+        items = wrapped_cases if isinstance(wrapped_cases, list) else [wrapped_cases]
+    else:
+        # 兼容旧版模型直接返回单对象或数组的格式。
+        items = parsed if isinstance(parsed, list) else [parsed]
+    valid_cases = []
+    errors = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"第 {index} 项不是 JSON 对象")
+            continue
+        case = {field: str(item.get(field, "")).strip() for field in FULL_CASE_FIELDS}
+        missing_fields = [field for field, value in case.items() if not value]
+        if missing_fields:
+            errors.append(f"第 {index} 项缺少字段：{', '.join(missing_fields)}")
+            continue
+        alignment_error = _get_step_expectation_alignment_error(
+            case["operation_steps"], case["expected_result"]
+        )
+        if not alignment_error:
+            case["priority"] = normalise_priority(item.get("priority", DEFAULT_PRIORITY))
+            valid_cases.append(case)
+        else:
+            errors.append(f"第 {index} 项{alignment_error}")
+
+    # 一个焦点测试点可能被拆成多个场景；只接受整批都有效的响应，
+    # 避免某个场景格式错误时静默丢失业务覆盖。
+    if errors:
+        result = ([], "；".join(errors))
+    elif valid_cases:
+        result = (valid_cases, "")
+    else:
+        result = ([], "；".join(errors) or "模型响应不包含有效用例")
+    return result if with_diagnostics else result[0]
+
+
+def _steps_and_expectations_are_aligned(operation_steps, expected_result):
+    """只接受编号连续、数量相同的步骤和预期，防止生成不成对的用例。"""
+    return not _get_step_expectation_alignment_error(operation_steps, expected_result)
+
+
+def _get_step_expectation_alignment_error(operation_steps, expected_result):
+    """返回不成对原因，仅含编号与数量，不记录具体用例内容。"""
+    number_pattern = r"(?m)^\s*(\d+)[.、)]\s+\S"
+    step_numbers = [int(number) for number in re.findall(number_pattern, operation_steps)]
+    expected_numbers = [int(number) for number in re.findall(number_pattern, expected_result)]
+    expected_sequence = list(range(1, len(step_numbers) + 1))
+    if not step_numbers:
+        return "操作步骤未使用连续数字编号"
+    if step_numbers != expected_sequence:
+        return f"操作步骤编号不连续（检测到 {step_numbers}）"
+    if len(expected_numbers) != len(step_numbers):
+        return f"步骤 {len(step_numbers)} 条、预期 {len(expected_numbers)} 条，数量不一致"
+    if expected_numbers != expected_sequence:
+        return f"预期结果编号不连续（检测到 {expected_numbers}）"
+    return ""
+
+
+def build_project_test_point_context(case_titles):
+    """将既有叶子路径汇总为完整项目测试点上下文，不改变节点遍历逻辑。"""
+    return "\n".join(
+        f"[{index}] {test_point}" for index, test_point in enumerate(case_titles, start=1)
+    )
+
+
+def split_hierarchy_path(value):
+    """按生成器插入的层级分隔符拆分，保留节点名称内部的半角连字符。"""
+    return [
+        part.strip()
+        for part in re.split(r"\s+-\s+|\s*－\s*", str(value or ""))
+        if part.strip()
+    ]
+
+
+def is_leaf_topic_node(node):
+    """FreeMind 叶子允许包含 font、icon 等元数据，但不能包含子主题 node。"""
+    return not any(child.tag.rsplit("}", 1)[-1] == "node" for child in node)
+
+
+def build_module_paths(case_titles):
+    """按配置顺序返回实际出现的明确模块及兜底模块。"""
+    discovered = {get_summary_module_key(case_title) for case_title in case_titles}
+    return [module for module in BUSINESS_MODULE_OPTIONS if module in discovered]
+
+
+def get_summary_module_key(case_title):
+    """从层级路径匹配权威业务模块，未匹配时统一归入兜底模块。"""
+    parts = [clean_tester_annotation(part) for part in split_hierarchy_path(case_title)]
+    parts = [part for part in parts if part]
+    return next((part for part in parts[1:] if part in BUSINESS_MODULES), FALLBACK_BUSINESS_MODULE)
+
+
+def ensure_module_prefix(case_title, source_path, module_name=""):
+    """确保标题使用模型识别且来自原始路径的业务模块名称。"""
+    title = clean_tester_annotation(case_title)
+    source_parts = [clean_tester_annotation(part) for part in split_hierarchy_path(source_path)
+                    if clean_tester_annotation(part)]
+    matched_module = get_summary_module_key(source_path)
+    valid_modules = [matched_module] if matched_module else []
+    module_name = clean_tester_annotation(module_name)
+    if module_name not in valid_modules:
+        module_name = valid_modules[0] if valid_modules else ""
+    if not title or not module_name:
+        return title
+
+    # 版本号属于发布元数据，不属于业务模块；清理模型可能带出的版本前缀。
+    title_parts = split_hierarchy_path(title)
+    # 只保留一个模块前缀，清理模型重复复述模块的情况。
+    while len(title_parts) >= 2 and title_parts[0] == module_name and title_parts[1] == module_name:
+        title_parts.pop(1)
+    title = " - ".join(title_parts) if title_parts else title
+    while title_parts and re.fullmatch(r"[Vv]?\d+(?:\.\d+)+", title_parts[0]):
+        title_parts.pop(0)
+    title = " - ".join(title_parts) if title_parts else title
+
+    # 已有模块前缀时保留模型生成的其余标题；否则用稳定分隔符补齐。
+    title_parts = split_hierarchy_path(title)
+    if title_parts and title_parts[0] == module_name:
+        return " - ".join(title_parts)
+    return f"{module_name} - {title}"
+
+
+def _normalise_project_summary(content, module_paths):
+    """只接受项目摘要及已知模块路径的摘要，防止模型自造模块结构。"""
+    parsed = content if isinstance(content, dict) else _extract_json_value(content)
+    if not isinstance(parsed, dict):
+        return None
+
+    project_summary = str(parsed.get("project_summary", "")).strip()
+    raw_module_summaries = parsed.get("module_summaries", {})
+    if not project_summary or not isinstance(raw_module_summaries, dict):
+        return None
+
+    module_summaries = {
+        module_path: str(raw_module_summaries.get(module_path, "")).strip()
+        for module_path in module_paths
+    }
+    if any(not value for value in module_summaries.values()):
+        return None
+    return {
+        "project_summary": project_summary,
+        "module_summaries": module_summaries,
+    }
+
+
+def llm_generate_project_summary(project_test_point_context, module_paths, model):
+    """使用推理模型一次性生成全图和模块业务摘要。"""
+    try:
+        config = get_llm_config()
+    except (ValueError, OSError) as exc:
+        logger.error("项目摘要 LLM 配置不可用：%s", exc)
+        return None
+
+    prompt = PROJECT_SUMMARY_SYSTEM_PROMPT.replace(
+        "{{module_paths}}", "\n".join(module_paths)
+    ).replace("{{project_test_points}}", project_test_point_context)
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config['api_key']}"}
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": LLM_PROJECT_SUMMARY_MAX_TOKENS,
+        "response_format": {"type": "json_object"},
+    }
+
+    last_failure_reason = "未知错误"
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                config["api_url"], headers=headers, json=payload,
+                timeout=(LLM_CONNECT_TIMEOUT_SECONDS, LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            response_body = response.json()
+            content = _extract_response_content(response_body)
+            summary = _normalise_project_summary(content, module_paths)
+            if summary:
+                logger.info("项目摘要生成成功：模型 %s，响应长度 %s 字符", model, len(content))
+                return summary
+
+            last_failure_reason = "模型未返回有效项目摘要 JSON"
+            logger.warning("项目摘要响应无效（第 %s/%s 次）：%s；%s", attempt,
+                           LLM_MAX_RETRIES, last_failure_reason, _response_diagnostic(content))
+            if not content:
+                logger.warning("项目摘要返回空 content：%s", _response_metadata(response_body))
+        except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as exc:
+            last_failure_reason = f"LLM 请求或响应异常：{exc}"
+            logger.warning("项目摘要请求失败（第 %s/%s 次）：%s", attempt,
+                           LLM_MAX_RETRIES, last_failure_reason)
+
+        if attempt < LLM_MAX_RETRIES:
+            time.sleep(2)
+
+    logger.error("项目摘要生成失败：%s", last_failure_reason)
+    return None
+
+
+def load_or_generate_project_summary(csv_file, project_test_point_context, module_paths, model):
+    """按思维导图内容哈希复用项目摘要，避免每次续传重复推理全图。"""
+    cache_file = csv_file + ".project_context.json"
+    source_hash = hashlib.sha256(project_test_point_context.encode("utf-8")).hexdigest()
+
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if (cached.get("cache_version") == PROJECT_SUMMARY_CACHE_VERSION
+                    and cached.get("source_hash") == source_hash
+                    and cached.get("model") == model
+                    and cached.get("module_paths") == module_paths):
+                summary = _normalise_project_summary(cached.get("summary", {}), module_paths)
+                if summary:
+                    logger.info("已复用项目摘要缓存：%s", cache_file)
+                    return summary
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            logger.warning("项目摘要缓存不可用，将重新生成：%s", exc)
+
+    summary = llm_generate_project_summary(project_test_point_context, module_paths, model)
+    if not summary:
+        return None
+
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump({"cache_version": PROJECT_SUMMARY_CACHE_VERSION, "source_hash": source_hash,
+                   "model": model, "module_paths": module_paths, "summary": summary}, f,
+                  ensure_ascii=False, indent=2)
+    return summary
+
+
+def build_complete_case_input(project_test_point_context, focused_test_point, project_summary=None,
+                              module_summary=""):
+    """优先使用推理后的项目摘要；摘要不可用时兼容全图上下文。"""
+    if project_summary:
+        return (
+            "【项目业务摘要】\n"
+            f"{project_summary}\n\n"
+            "【当前模块摘要】\n"
+            f"{module_summary or '无额外模块摘要'}\n\n"
+            "【当前焦点测试点】\n"
+            f"{focused_test_point}"
+        )
+    return (
+        "【整份思维导图测试点】\n"
+        f"{project_test_point_context}\n\n"
+        "【当前焦点测试点】\n"
+        f"{focused_test_point}"
+    )
+
+
+def llm_generate_complete_case(full_test_point_str, model=None):
+    """按全图上下文及当前焦点测试点生成结构化用例；失败时返回空列表。"""
+    focus_match = re.search(r"【当前焦点测试点】\s*(.*)$", full_test_point_str, flags=re.S)
+    focused_test_point = focus_match.group(1).strip() if focus_match else full_test_point_str
+    if len(full_test_point_str) > LLM_CONTEXT_WARNING_CHARS:
+        logger.warning("全图测试点上下文超过预警值 %s 字符，需使用支持足够上下文窗口的模型；内容未截断。",
+                       LLM_CONTEXT_WARNING_CHARS)
+    try:
+        config = get_llm_config()
+    except (ValueError, OSError) as exc:
+        logger.error("LLM配置不可用，保留原始测试点：%s", exc)
+        return []
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config['api_key']}"}
+    payload = {
+        "model": model or get_workflow_models()["generation_model"],
+        "messages": [{"role": "system", "content": FULL_CASE_SYSTEM_PROMPT.replace(
+            "{{full_test_point_text}}", full_test_point_str).replace(
+            "{{tester_names}}", "、".join(sorted(TESTER_NAMES)) or "（名单为空）").replace(
+            "{{business_modules}}", "、".join(BUSINESS_MODULE_OPTIONS))}],
+        "temperature": 0,
+        "max_tokens": LLM_FULL_CASE_MAX_TOKENS,
+    }
+    # 部分兼容模型在 JSON mode 下会返回 HTTP 200 但 message.content 为空，默认依赖提示词约束。
+    # 已确认当前模型支持时，可在 .env 显式设置 ENABLE_LLM_JSON_MODE=true 开启。
+    use_json_mode = os.getenv("ENABLE_LLM_JSON_MODE", "false").lower() == "true"
+    if use_json_mode and config["provider"] == "deepseek":
+        payload["response_format"] = {"type": "json_object"}
+
+    last_failure_reason = "未知错误"
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                config["api_url"], headers=headers, json=payload,
+                timeout=(LLM_CONNECT_TIMEOUT_SECONDS, LLM_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            response_body = response.json()
+            content = _extract_response_content(response_body)
+            cases, invalid_reason = _normalise_full_case_response(content, with_diagnostics=True)
+            if cases:
+                logger.info("LLM返回解析成功：模型 %s，生成 %s 条用例，响应长度 %s 字符",
+                            payload["model"], len(cases), len(content))
+                return cases
+            last_failure_reason = invalid_reason
+            logger.warning("LLM 响应格式无效（第 %s/%s 次）：%s；%s",
+                           attempt, LLM_MAX_RETRIES, invalid_reason,
+                           _response_diagnostic(content))
+            if not content:
+                logger.warning("LLM 返回空 content：%s", _response_metadata(response_body))
+            # 下一次请求明确告知上次的格式问题，使重试不再重复同一输出模式。
+            payload["messages"] = [
+                payload["messages"][0],
+                {"role": "user", "content": (
+                    "上一次响应无法作为测试用例 JSON 导入。请重新生成，只返回合法 JSON，"
+                    "根对象必须为 {\"cases\": [...]}，不要 markdown、解释或代码块。"
+                )},
+            ]
+        except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as exc:
+            last_failure_reason = f"LLM 请求或响应异常：{exc}"
+            logger.warning("LLM 请求失败（第 %s/%s 次）：%s", attempt, LLM_MAX_RETRIES,
+                           last_failure_reason)
+
+        if attempt < LLM_MAX_RETRIES:
+            time.sleep(2)
+
+    logger.error("LLM生成失败，保留当前焦点测试点：%s；失败原因：%s",
+                 focused_test_point, last_failure_reason)
+    return []
+
+
+# ===== LLM API 调用函数 =====
+
+
+# ===== 标题解析函数（修改：保留括号内容，调整标题格式） =====
+def parse_case_title(data):
+    """解析带层级的标题，保留括号内容（含全角/半角分隔符处理）"""
+    try:
+        # print(f"\n==== 开始解析标题 ====")
+        # print(f"原始标题: {data}")
+
+        # 1. 处理全角/半角分隔符（- 和 －），并保留前后空格
+        parts = split_hierarchy_path(data)
+
+        # print(f"分割后的层级列表: {parts}")  # 新增调试日志，查看分割是否正确
+
+        # 2. 检查层级数量
+        if len(parts) < 2:
+            print(f"⚠️ 层级不足（需至少2层），原始标题: {data}")
+            return None, None
+
+        # 3. 构建标题和模块（直接使用原始分割结果，不做二次处理）
+        formatted_title = " - ".join(parts[1:])  # 从第2层开始到最后一层
+        module = " - ".join(parts[1:-1]) if len(parts) > 2 else ""  # 中间层作为模块
+        module_path = f"/{module}/" if module else "/"
+
+        # print(f"解析结果:")
+        # print(f"  格式化标题: {formatted_title}")
+        # print(f"  所属模块: {module}")
+        # print(f"==== 解析完成 ====\n")
+
+        return formatted_title, module_path
+
+    except Exception as e:
+        print(f"❌ 解析失败: {str(e)}")
+        return None, None
+
+
+def _ensure_export_header(csv_file):
+    """为旧 CSV 补充新列，避免断点续跑时表头与数据字段不一致。"""
+    if not os.path.exists(csv_file):
+        os.makedirs(os.path.dirname(csv_file), exist_ok=True)
+        with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=EXPORT_FIELDS).writeheader()
+        return
+
+    with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        current_fields = reader.fieldnames or []
+        rows = list(reader)
+
+    if current_fields == EXPORT_FIELDS:
+        return
+
+    # 完整模式曾输出英文内部字段；迁移时仅保留原有测试管理平台字段。
+    with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _restore_failed_cases(csv_file, breakpoint_file):
+    """移除旧版失败占位行及其断点，使其在下次执行时重新生成。"""
+    if not os.path.exists(csv_file):
+        return 0
+
+    with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    failed_prefix = "[LLM生成失败] "
+    failed_titles = {
+        row.get("用例名称", "")[len(failed_prefix):].strip()
+        for row in rows
+        if row.get("用例名称", "").startswith(failed_prefix)
+    }
+    if not failed_titles:
+        return 0
+
+    remaining_rows = [
+        row for row in rows
+        if not row.get("用例名称", "").startswith(failed_prefix)
+    ]
+    with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(remaining_rows)
+
+    if os.path.exists(breakpoint_file):
+        with open(breakpoint_file, "r", encoding="utf-8") as f:
+            processed_titles = f.read().splitlines()
+        retained_titles = []
+        for raw_title in processed_titles:
+            formatted_title, _ = parse_case_title(raw_title)
+            if formatted_title not in failed_titles:
+                retained_titles.append(raw_title)
+        with open(breakpoint_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(retained_titles))
+            if retained_titles:
+                f.write("\n")
+
+    logger.warning("已恢复 %s 条历史 LLM 失败用例，后续将重新生成", len(failed_titles))
+    return len(failed_titles)
+
+
+def ensure_unique_case_titles(csv_file):
+    """微调同模块下的重复标题，便于在测试管理平台中区分用例。"""
+    if not os.path.exists(csv_file):
+        return 0
+
+    with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fields = reader.fieldnames or EXPORT_FIELDS
+
+    seen_counts = {}
+    used = set()
+    adjusted = 0
+    for row in rows:
+        module = str(row.get("所属模块", "")).strip()
+        original = str(row.get("用例名称", "")).strip()
+        base_key = (module, original)
+        seen_counts[base_key] = seen_counts.get(base_key, 0) + 1
+        candidate = original
+        if (module, candidate) in used:
+            number = seen_counts[base_key]
+            candidate = f"{original}（场景{number}）"
+            while (module, candidate) in used:
+                number += 1
+                candidate = f"{original}（场景{number}）"
+            row["用例名称"] = candidate
+            adjusted += 1
+        used.add((module, candidate))
+
+    if adjusted:
+        temporary = f"{csv_file}.unique-titles.tmp"
+        with open(temporary, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary, csv_file)
+        logger.warning("检测到同模块重复用例名称，已微调 %s 条", adjusted)
+    return adjusted
+
+
+# ===== 主处理函数（修复断点文件处理逻辑） =====
+def freemind_to_cases(freemind_file, csv_file):
+    tree = ET.parse(freemind_file)
+
+    root = tree.getroot()
+    case_points = []
+
+    # 仅在最后一个层次（叶子节点）创建用例名称
+    def parse_node(node, parent_text=None):
+        topic = node.attrib.get("TEXT")
+        if topic:
+            full_topic = f"{parent_text} - {topic}" if parent_text else topic
+            # 仅当该节点没有子节点（即叶子节点）时，才添加到用例名称列表
+            if is_leaf_topic_node(node):
+                source_node_id = node.attrib.get("ID") or hashlib.sha256(
+                    full_topic.strip().encode("utf-8")
+                ).hexdigest()[:32]
+                case_points.append({"path": full_topic.strip(), "source_node_id": source_node_id})
+            for child in node:
+                parse_node(child, full_topic)
+        else:
+            for child in node:
+                parse_node(child, parent_text)
+
+    parse_node(root)
+
+    # 过滤没有业务层级的根节点；半角和全角横线都视为层级分隔符。
+    case_points = [
+        point for point in case_points
+        if len(split_hierarchy_path(point["path"])) >= 2
+    ]
+    case_titles = [point["path"] for point in case_points]
+    if not case_titles:
+        raise ValueError("输入文件没有可生成用例的叶子测试点（至少需要根节点和测试点两层）")
+    get_llm_config()  # 写入输出前校验配置。
+
+    # 复用原有叶子路径结果生成全图上下文；不修改 XML 读取和树遍历核心逻辑。
+    project_test_point_context = build_project_test_point_context(case_titles)
+    logger.info("已构造完整思维导图测试点上下文：%s 条叶子测试点，%s 字符",
+                len(case_titles), len(project_test_point_context))
+
+    # 完整运行始终重建目标文件；只有存在断点时才继续追加未完成项。
+    breakpoint_file = csv_file + ".breakpoint"
+    if not os.path.exists(breakpoint_file) and os.path.exists(csv_file):
+        os.remove(csv_file)
+
+    # 创建文件或为中断文件补齐完整用例字段，并恢复旧版失败占位用例。
+    _ensure_export_header(csv_file)
+
+    # 检查断点文件
+    _restore_failed_cases(csv_file, breakpoint_file)
+    processed_titles = set()
+
+    if os.path.exists(breakpoint_file):
+        with open(breakpoint_file, "r", encoding="utf-8") as f:
+            processed_titles = set(f.read().splitlines())
+        if not processed_titles.issubset(set(case_titles)):
+            raise ValueError("断点与当前输入不匹配，请为变更后的测试点指定新的 --output")
+        print(f"✅ 加载断点文件，已处理{len(processed_titles)}条用例")
+    else:
+        print("✅ 未找到断点文件，将处理所有用例")
+
+    total = len(case_titles)
+    remaining = total - len(processed_titles)
+    print(f"共{total}条测试用例，剩余{remaining}条需要处理")
+
+    project_summary_data = None
+    generation_model = None
+    if remaining:
+        try:
+            config = get_llm_config()
+            workflow_models = get_workflow_models()
+            module_paths = build_module_paths(case_titles)
+            project_summary_data = load_or_generate_project_summary(
+                csv_file, project_test_point_context, module_paths, workflow_models["reasoning_model"]
+            )
+            generation_model = workflow_models["generation_model"]
+            if project_summary_data:
+                logger.info("将使用项目/模块摘要生成用例：推理模型 %s，生成模型 %s，模块范围 %s 个",
+                            workflow_models["reasoning_model"], generation_model, len(module_paths))
+            else:
+                raise RuntimeError(
+                    "项目摘要生成失败，已停止用例生成；为保证测试用例质量，不使用完整思维导图上下文降级生成"
+                )
+        except (ValueError, OSError) as exc:
+            raise RuntimeError(f"无法初始化双阶段模型，已停止用例生成：{exc}") from exc
+
+    has_failures = False
+    # 即使第一条生成失败，也保留空断点，使重跑能够恢复已有输出。
+    Path(breakpoint_file).touch(exist_ok=True)
+
+    for i, data in enumerate(case_titles):
+        # 只有在断点文件存在且包含当前标题时才跳过
+        if os.path.exists(breakpoint_file) and data in processed_titles:
+            print(f"⏩ 跳过已处理的用例: {data}")
+            continue
+
+        try:
+            print(f"正在处理 ({i + 1}/{total}): {data}")
+
+            title, module = parse_case_title(data)
+            if not title:
+                has_failures = True
+                print(f"⚠️ 标题解析失败，跳过: {data}")
+                continue
+
+            # 全图推理摘要提供业务上下文；当前叶子路径始终定义本条必须覆盖的测试点。
+            summary_module_key = get_summary_module_key(data)
+            module_summary = (
+                project_summary_data["module_summaries"].get(summary_module_key, "")
+                if project_summary_data else ""
+            )
+            complete_case_input = build_complete_case_input(
+                project_test_point_context, data,
+                project_summary=project_summary_data["project_summary"] if project_summary_data else None,
+                module_summary=module_summary,
+            )
+            generated_cases = llm_generate_complete_case(complete_case_input, model=generation_model)
+            if not generated_cases:
+                has_failures = True
+                logger.warning("本次未生成用例，不写入 CSV 或断点；下次将从该用例继续：%s", data)
+                continue
+
+            # 数组响应按独立场景拆分为多行，旧字段同步写入以保持导入兼容。
+            with open(csv_file, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=EXPORT_FIELDS, extrasaction="ignore")
+                for generated_case in generated_cases:
+                    temp = copy.deepcopy(cases_format)
+                    temp["源测试点ID"] = case_points[i]["source_node_id"]
+                    temp["用例名称"] = ensure_module_prefix(
+                        generated_case["case_title"], data, generated_case.get("module_name", "")
+                    )
+                    source_parts = [clean_tester_annotation(part) for part in split_hierarchy_path(data)
+                                    if clean_tester_annotation(part)]
+                    matched_module = get_summary_module_key(data)
+                    valid_modules = [matched_module] if matched_module else []
+                    generated_module = clean_tester_annotation(generated_case.get("module_name", ""))
+                    temp["所属模块"] = generated_module if generated_module in valid_modules else (valid_modules[0] if valid_modules else module)
+                    temp["优先级"] = normalise_priority(generated_case.get("priority"))
+                    temp["前置条件"] = generated_case["precondition"]
+                    temp["步骤"] = generated_case["operation_steps"]
+                    temp["预期"] = generated_case["expected_result"]
+                    temp.update(generated_case)
+                    writer.writerow(temp)
+
+            # 记录断点
+            with open(breakpoint_file, "a", encoding="utf-8") as f:
+                f.write(f"{data}\n")
+
+            time.sleep(1.5)  # 避免速率限制
+
+        except KeyboardInterrupt:
+            ensure_unique_case_titles(csv_file)
+            raise
+        except Exception as e:
+            has_failures = True
+            print(f"❌ 处理失败: {str(e)}")
+
+    # 仅在所有用例均成功时删除断点；失败项没有断点，会在下次执行时重试。
+    if os.path.exists(breakpoint_file):
+        if has_failures:
+            print("⚠️ 存在未成功生成的用例，已保留断点文件以便下次续传")
+        else:
+            os.remove(breakpoint_file)
+
+    adjusted_titles = ensure_unique_case_titles(csv_file)
+    with open(csv_file, "r", newline="", encoding="utf-8-sig") as handle:
+        generated_count = sum(1 for _ in csv.DictReader(handle))
+    if has_failures:
+        raise RuntimeError(f"部分测试点生成失败；CSV 已保留 {generated_count} 条用例，请使用相同命令重试")
+    print(f"\n✅ 全部完成，{total}条测试点共生成{generated_count}条测试用例，微调重复标题{adjusted_titles}条")
+
+
+# ===== 程序入口 =====
+def main(argv=None):
+    parser = ChineseArgumentParser(description="根据 FreeMind 测试点生成测试用例 CSV。")
+    parser.add_argument("--input", default=f"inputs/freemind/{FREEMIND_FILE}",
+                        help="FreeMind .mm 文件；相对路径以项目根目录为基准")
+    parser.add_argument("--output", help="输出 CSV；默认 outputs/csv/<输入名>_full_cases.csv")
+    parser.add_argument("--check-config", action="store_true", help="仅检查配置，不调用模型、不输出密钥")
+    args = parser.parse_args(argv)
+
+    try:
+        llm_config = get_llm_config()
+        workflow_models = get_workflow_models()
+        if any(not value.strip() for value in workflow_models.values()):
+            raise ValueError("推理模型和用例生成模型名称不能为空")
+        print(f"当前模型提供商: {llm_config['provider']} | "
+              f"全图推理: {workflow_models['reasoning_model']} | 用例生成: {workflow_models['generation_model']}")
+        if args.check_config:
+            print("配置检查通过：API Key、接口地址、模型及业务配置已配置（未验证远程服务）")
+            return 0
+
+        input_path = Path(args.input)
+        if not input_path.is_absolute():
+            input_path = PROJECT_ROOT / input_path
+        output_path = Path(args.output) if args.output else Path("outputs/csv") / f"{input_path.stem}_full_cases.csv"
+        if not output_path.is_absolute():
+            output_path = PROJECT_ROOT / output_path
+        if input_path.suffix.lower() != ".mm":
+            raise ValueError("输入文件必须是 FreeMind .mm 文件")
+        if output_path.suffix.lower() != ".csv":
+            raise ValueError("输出文件必须使用 .csv 扩展名")
+        if input_path.resolve() == output_path.resolve():
+            raise ValueError("输入文件和输出文件不能相同")
+        print(f"开始处理文件: {input_path}")
+        print(f"输出用例文件: {output_path}")
+        freemind_to_cases(str(input_path), str(output_path))
+        return 0
+    except KeyboardInterrupt:
+        print("\n生成已中断；请使用相同命令继续", file=sys.stderr)
+        return 130
+    except (ValueError, OSError, ET.ParseError, RuntimeError) as exc:
+        print(f"生成失败：{exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
