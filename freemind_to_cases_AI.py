@@ -29,7 +29,7 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 LLM_FULL_CASE_MAX_TOKENS = int(os.getenv("LLM_FULL_CASE_MAX_TOKENS", "4000"))
 LLM_PROJECT_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_PROJECT_SUMMARY_MAX_TOKENS", "24000"))
 LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_PROJECT_SUMMARY_TIMEOUT_SECONDS", "180"))
-PROJECT_SUMMARY_CACHE_VERSION = 6
+PROJECT_SUMMARY_CACHE_VERSION = 7
 # 仅用于日志预警，不会截断任何思维导图测试点上下文。
 LLM_CONTEXT_WARNING_CHARS = int(os.getenv("LLM_CONTEXT_WARNING_CHARS", "150000"))
 TESTER_NAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "tester-names.json")
@@ -222,11 +222,18 @@ def get_llm_config():
 
 
 def get_workflow_models():
-    """为全图推理和批量用例生成选择独立模型，允许环境变量覆盖。"""
-    return {
-        "reasoning_model": os.getenv("LLM_REASONING_MODEL", "deepseek-v4-pro"),
-        "generation_model": os.getenv("LLM_GENERATION_MODEL", "deepseek-chat"),
+    """读取摘要与用例生成阶段的模型及思考强度。"""
+    models = {
+        "reasoning_model": os.getenv("LLM_REASONING_MODEL", "deepseek-flash"),
+        "reasoning_effort": os.getenv("LLM_SUMMARY_REASONING_EFFORT", "high"),
+        "generation_model": os.getenv("LLM_GENERATION_MODEL", "deepseek-flash"),
+        "generation_reasoning_effort": os.getenv("LLM_GENERATION_REASONING_EFFORT", "low"),
     }
+    valid_efforts = {"none", "low", "high", "max"}
+    for key in ("reasoning_effort", "generation_reasoning_effort"):
+        if models[key] not in valid_efforts:
+            raise ValueError(f"{key} 必须是以下值之一：{', '.join(sorted(valid_efforts))}")
+    return models
 
 
 def _strip_json_markdown(text):
@@ -622,7 +629,7 @@ def _normalise_project_summary(content, module_paths):
     }
 
 
-def llm_generate_project_summary(project_test_point_context, module_paths, model):
+def llm_generate_project_summary(project_test_point_context, module_paths, model, reasoning_effort):
     """使用推理模型一次性生成全图和模块业务摘要。"""
     try:
         config = get_llm_config()
@@ -636,6 +643,7 @@ def llm_generate_project_summary(project_test_point_context, module_paths, model
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config['api_key']}"}
     payload = {
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "messages": [{"role": "system", "content": prompt}],
         "temperature": 0,
         "max_tokens": LLM_PROJECT_SUMMARY_MAX_TOKENS,
@@ -674,7 +682,8 @@ def llm_generate_project_summary(project_test_point_context, module_paths, model
     return None
 
 
-def load_or_generate_project_summary(csv_file, project_test_point_context, module_paths, model):
+def load_or_generate_project_summary(csv_file, project_test_point_context, module_paths, model,
+                                     reasoning_effort):
     """按思维导图内容哈希复用项目摘要，避免每次续传重复推理全图。"""
     cache_file = csv_file + ".project_context.json"
     source_hash = hashlib.sha256(project_test_point_context.encode("utf-8")).hexdigest()
@@ -686,6 +695,7 @@ def load_or_generate_project_summary(csv_file, project_test_point_context, modul
             if (cached.get("cache_version") == PROJECT_SUMMARY_CACHE_VERSION
                     and cached.get("source_hash") == source_hash
                     and cached.get("model") == model
+                    and cached.get("reasoning_effort") == reasoning_effort
                     and cached.get("module_paths") == module_paths):
                 summary = _normalise_project_summary(cached.get("summary", {}), module_paths)
                 if summary:
@@ -694,13 +704,16 @@ def load_or_generate_project_summary(csv_file, project_test_point_context, modul
         except (OSError, json.JSONDecodeError, AttributeError) as exc:
             logger.warning("项目摘要缓存不可用，将重新生成：%s", exc)
 
-    summary = llm_generate_project_summary(project_test_point_context, module_paths, model)
+    summary = llm_generate_project_summary(
+        project_test_point_context, module_paths, model, reasoning_effort
+    )
     if not summary:
         return None
 
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump({"cache_version": PROJECT_SUMMARY_CACHE_VERSION, "source_hash": source_hash,
-                   "model": model, "module_paths": module_paths, "summary": summary}, f,
+                   "model": model, "reasoning_effort": reasoning_effort,
+                   "module_paths": module_paths, "summary": summary}, f,
                   ensure_ascii=False, indent=2)
     return summary
 
@@ -725,7 +738,7 @@ def build_complete_case_input(project_test_point_context, focused_test_point, pr
     )
 
 
-def llm_generate_complete_case(full_test_point_str, model=None):
+def llm_generate_complete_case(full_test_point_str, model=None, reasoning_effort="low"):
     """按全图上下文及当前焦点测试点生成结构化用例；失败时返回空列表。"""
     focus_match = re.search(r"【当前焦点测试点】\s*(.*)$", full_test_point_str, flags=re.S)
     focused_test_point = focus_match.group(1).strip() if focus_match else full_test_point_str
@@ -741,6 +754,7 @@ def llm_generate_complete_case(full_test_point_str, model=None):
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config['api_key']}"}
     payload = {
         "model": model or get_workflow_models()["generation_model"],
+        "reasoning_effort": reasoning_effort,
         "messages": [{"role": "system", "content": FULL_CASE_SYSTEM_PROMPT.replace(
             "{{full_test_point_text}}", full_test_point_str).replace(
             "{{tester_names}}", "、".join(sorted(TESTER_NAMES)) or "（名单为空）").replace(
@@ -1013,7 +1027,8 @@ def freemind_to_cases(freemind_file, csv_file):
             workflow_models = get_workflow_models()
             module_paths = build_module_paths(case_titles)
             project_summary_data = load_or_generate_project_summary(
-                csv_file, project_test_point_context, module_paths, workflow_models["reasoning_model"]
+                csv_file, project_test_point_context, module_paths,
+                workflow_models["reasoning_model"], workflow_models["reasoning_effort"]
             )
             generation_model = workflow_models["generation_model"]
             if project_summary_data:
@@ -1056,7 +1071,10 @@ def freemind_to_cases(freemind_file, csv_file):
                 project_summary=project_summary_data["project_summary"] if project_summary_data else None,
                 module_summary=module_summary,
             )
-            generated_cases = llm_generate_complete_case(complete_case_input, model=generation_model)
+            generated_cases = llm_generate_complete_case(
+                complete_case_input, model=generation_model,
+                reasoning_effort=workflow_models["generation_reasoning_effort"],
+            )
             if not generated_cases:
                 has_failures = True
                 logger.warning("本次未生成用例，不写入 CSV 或断点；下次将从该用例继续：%s", data)
@@ -1127,7 +1145,10 @@ def main(argv=None):
         if any(not value.strip() for value in workflow_models.values()):
             raise ValueError("推理模型和用例生成模型名称不能为空")
         print(f"当前模型提供商: {llm_config['provider']} | "
-              f"全图推理: {workflow_models['reasoning_model']} | 用例生成: {workflow_models['generation_model']}")
+              f"整图摘要: {workflow_models['reasoning_model']} "
+              f"(reasoning_effort={workflow_models['reasoning_effort']}) | "
+              f"用例生成: {workflow_models['generation_model']} "
+              f"(reasoning_effort={workflow_models['generation_reasoning_effort']})")
         if args.check_config:
             print("配置检查通过：API Key、接口地址、模型及业务配置已配置（未验证远程服务）")
             return 0

@@ -24,15 +24,23 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 编辑 `.env`，以 DeepSeek 为例：
 
 ```dotenv
+# 当前模型服务类型，此项目目前只支持 DeepSeek。
 LLM_PROVIDER=deepseek
+# DeepSeek API 密钥，请填写自己的密钥。
 DEEPSEEK_API_KEY=填写自己的密钥
+# DeepSeek Chat Completions 接口地址。
 DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
-LLM_REASONING_MODEL=deepseek-reasoner
-LLM_GENERATION_MODEL=deepseek-chat
+# 阶段一用来生成整图和模块摘要的模型及思考强度。
+LLM_REASONING_MODEL=deepseek-flash
+LLM_SUMMARY_REASONING_EFFORT=high
+# 阶段二用来逐点生成测试用例的模型及思考强度。
+LLM_GENERATION_MODEL=deepseek-flash
+LLM_GENERATION_REASONING_EFFORT=low
+# 整图摘要最多生成的 token 数，默认值为 24000。
 LLM_PROJECT_SUMMARY_MAX_TOKENS=24000
 ```
 
-`LLM_REASONING_MODEL` 用于整图/模块摘要，`LLM_GENERATION_MODEL` 用于生成用例；请填写账号实际可用的模型名称。上述模板不代表当前账号的模型权限。本次整理保留了当前 `.env` 的模型设置。
+`LLM_REASONING_MODEL` 与 `LLM_SUMMARY_REASONING_EFFORT` 用于整图/模块摘要；`LLM_GENERATION_MODEL` 与 `LLM_GENERATION_REASONING_EFFORT` 用于逐节点生成用例。DeepSeek 当前模型 ID 使用 `deepseek-flash`，思考强度通过 API 请求参数 `reasoning_effort` 设定。官方文档列出的强度包括 `low`、`high` 和 `max`。
 
 当前仅支持 DeepSeek，`LLM_PROVIDER` 设置为 `deepseek`。`DEEPSEEK_API_URL` 为完整的聊天补全接口 URL，默认是 `https://api.deepseek.com/chat/completions`。
 
