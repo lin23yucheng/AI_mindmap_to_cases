@@ -683,6 +683,18 @@ def llm_generate_project_summary(project_test_point_context, module_paths, model
 
 def load_or_generate_project_summary(csv_file, project_test_point_context, module_paths, model,
                                      reasoning_effort):
+    started_at = time.perf_counter()
+    try:
+        return _load_or_generate_project_summary(
+            csv_file, project_test_point_context, module_paths, model, reasoning_effort
+        )
+    finally:
+        elapsed = time.perf_counter() - started_at
+        print(f"⏱️ 整图摘要阶段耗时 {elapsed:.2f} 秒")
+
+
+def _load_or_generate_project_summary(csv_file, project_test_point_context, module_paths, model,
+                                      reasoning_effort):
     """按思维导图内容哈希复用项目摘要，避免每次续传重复推理全图。"""
     cache_file = csv_file + ".project_context.json"
     source_hash = hashlib.sha256(project_test_point_context.encode("utf-8")).hexdigest()
@@ -953,7 +965,7 @@ def ensure_unique_case_titles(csv_file):
 
 
 # ===== 主处理函数（修复断点文件处理逻辑） =====
-def freemind_to_cases(freemind_file, csv_file):
+def freemind_to_cases(freemind_file, csv_file, run_stats=None):
     tree = ET.parse(freemind_file)
 
     root = tree.getroot()
@@ -1050,6 +1062,8 @@ def freemind_to_cases(freemind_file, csv_file):
             print(f"⏩ 跳过已处理的用例: {data}")
             continue
 
+        point_started_at = time.perf_counter()
+        point_generated_count = 0
         try:
             print(f"正在处理 ({i + 1}/{total}): {data}")
 
@@ -1100,6 +1114,9 @@ def freemind_to_cases(freemind_file, csv_file):
                     temp["预期"] = generated_case["expected_result"]
                     temp.update(generated_case)
                     writer.writerow(temp)
+                    point_generated_count += 1
+                    if run_stats is not None:
+                        run_stats["generated_cases"] += 1
 
             # 记录断点
             with open(breakpoint_file, "a", encoding="utf-8") as f:
@@ -1113,6 +1130,9 @@ def freemind_to_cases(freemind_file, csv_file):
         except Exception as e:
             has_failures = True
             print(f"❌ 处理失败: {str(e)}")
+        finally:
+            elapsed = time.perf_counter() - point_started_at
+            print(f"⏱️ 测试点耗时 {elapsed:.2f} 秒，本次生成 {point_generated_count} 条用例")
 
     # 仅在所有用例均成功时删除断点；失败项没有断点，会在下次执行时重试。
     if os.path.exists(breakpoint_file):
@@ -1164,9 +1184,10 @@ def main(argv=None):
             raise ValueError("输出文件必须使用 .csv 扩展名")
         if input_path.resolve() == output_path.resolve():
             raise ValueError("输入文件和输出文件不能相同")
+        run_stats = {"started_at": time.perf_counter(), "generated_cases": 0}
         print(f"开始处理文件: {input_path}")
         print(f"输出用例文件: {output_path}")
-        freemind_to_cases(str(input_path), str(output_path))
+        freemind_to_cases(str(input_path), str(output_path), run_stats=run_stats)
         return 0
     except KeyboardInterrupt:
         print("\n生成已中断；请使用相同命令继续", file=sys.stderr)
@@ -1174,6 +1195,10 @@ def main(argv=None):
     except (ValueError, OSError, ET.ParseError, RuntimeError) as exc:
         print(f"生成失败：{exc}", file=sys.stderr)
         return 1
+    finally:
+        if "run_stats" in locals():
+            elapsed = time.perf_counter() - run_stats["started_at"]
+            print(f"\n本次执行总耗时 {elapsed:.2f} 秒，生成用例 {run_stats['generated_cases']} 条")
 
 
 if __name__ == "__main__":
